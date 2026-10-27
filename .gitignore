@@ -16,3 +16,7 @@ __pycache__/
 *.py[cod]
 .~lock.*
 .DS_Store
+
+# Trade history and result logs
+*.csv
+
