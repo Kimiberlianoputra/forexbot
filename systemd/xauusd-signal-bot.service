@@ -1,15 +1,16 @@
 [Unit]
 Description=XAU/USD Signal Bot
-Documentation=file:%h/xauusd-signal-bot/README.md
+Documentation=file://__PROJECT_DIR__/README.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/xauusd-signal-bot
-EnvironmentFile=%h/xauusd-signal-bot/.env
-ExecStart=%h/xauusd-signal-bot/venv/bin/python %h/xauusd-signal-bot/main.py
-Restart=on-failure
+WorkingDirectory=__PROJECT_DIR__
+EnvironmentFile=__PROJECT_DIR__/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__PROJECT_DIR__/venv/bin/python __PROJECT_DIR__/main.py
+Restart=always
 RestartSec=10
 
 # Logging goes to the user journal

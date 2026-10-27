@@ -6,6 +6,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="xauusd-signal-bot"
+TRACKER_SERVICE="xauusd-tracker"
 SERVICE_DIR="$HOME/.config/systemd/user"
 VENV_DIR="$PROJECT_DIR/venv"
 
@@ -14,17 +15,17 @@ echo "  XAU/USD Signal Bot — Uninstaller"
 echo "============================================================"
 echo
 
-# Stop and disable service
-if systemctl --user list-unit-files | grep -q "$SERVICE_NAME.service"; then
-    echo "→ Stopping and disabling service…"
-    systemctl --user stop "$SERVICE_NAME.service" 2>/dev/null || true
-    systemctl --user disable "$SERVICE_NAME.service" 2>/dev/null || true
-    rm -f "$SERVICE_DIR/$SERVICE_NAME.service"
-    systemctl --user daemon-reload
-    echo "✓ Service removed"
-else
-    echo "✓ Service not installed"
-fi
+# Stop and disable services
+for s in "$SERVICE_NAME" "$TRACKER_SERVICE"; do
+    if systemctl --user list-unit-files 2>/dev/null | grep -q "$s.service"; then
+        echo "→ Stopping and disabling $s.service…"
+        systemctl --user stop "$s.service" 2>/dev/null || true
+        systemctl --user disable "$s.service" 2>/dev/null || true
+        rm -f "$SERVICE_DIR/$s.service"
+        echo "✓ Removed $s.service"
+    fi
+done
+systemctl --user daemon-reload
 
 # Remove venv
 if [ -d "$VENV_DIR" ]; then

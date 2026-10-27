@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import shutil
 import subprocess
 
@@ -20,6 +21,7 @@ import requests
 log = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+_SESSION = requests.Session()
 
 def _esc(value) -> str:
     """HTML-escape a value for safe insertion into a Telegram HTML message."""
@@ -29,6 +31,7 @@ def send_telegram(token: str, chat_id: str, message: str) -> bool:
     """
     Send a message via Telegram (HTML parse mode).
 
+    Uses a persistent HTTP session to eliminate connection and TLS overhead.
     Returns True on success.
     """
     if not token or not chat_id:
@@ -44,7 +47,7 @@ def send_telegram(token: str, chat_id: str, message: str) -> bool:
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = _SESSION.post(url, json=payload, timeout=8)
     except requests.RequestException as exc:
         log.error("Telegram request failed: %s", exc)
         return False
@@ -66,7 +69,7 @@ def send_telegram(token: str, chat_id: str, message: str) -> bool:
             "disable_web_page_preview": True,
         }
         try:
-            resp2 = requests.post(url, json=payload_plain, timeout=10)
+            resp2 = _SESSION.post(url, json=payload_plain, timeout=8)
             if resp2.status_code == 200 and resp2.json().get("ok"):
                 log.info("Telegram alert sent (plain-text fallback)")
                 return True
@@ -82,15 +85,18 @@ def send_desktop(title: str, message: str) -> None:
     """
     Best-effort desktop notification via notify-send (Fedora/GNOME/KDE).
 
-    Silently does nothing if notify-send isn't available.
+    Silently does nothing if running headless (no DISPLAY or WAYLAND_DISPLAY)
+    or if notify-send isn't available. Non-blocking so it never delays alerts.
     """
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return
     if shutil.which("notify-send") is None:
         return
     try:
-        subprocess.run(
+        subprocess.Popen(
             ["notify-send", "--urgency=normal", title, message],
-            check=False,
-            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except Exception as exc:  # noqa: BLE001
         log.debug("Desktop notification failed: %s", exc)

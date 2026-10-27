@@ -50,14 +50,35 @@ def record_signal(
     ema: float,
     body_ratio: float,
     rsi_threshold: float,
+    candle_time: datetime | str | int | float | None = None,
 ) -> str:
     """
     Append a signal to signals.csv and return its signal_id.
 
     signal_id is the UTC time in compact ISO format (YYYYMMDDTHHMMSSZ).
-    Because the strategy only fires once per trigger bar, this is unique.
+    Uses the candle close time when provided for exact bar alignment.
     """
-    now = datetime.now(timezone.utc)
+    if candle_time is None:
+        now = datetime.now(timezone.utc)
+    elif isinstance(candle_time, (int, float)):
+        now = datetime.fromtimestamp(candle_time, tz=timezone.utc)
+    elif isinstance(candle_time, datetime):
+        now = candle_time if candle_time.tzinfo else candle_time.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+    elif isinstance(candle_time, str):
+        try:
+            parsed = datetime.fromisoformat(candle_time.replace("Z", "+00:00"))
+            now = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            now = now.astimezone(timezone.utc)
+        except Exception:
+            try:
+                parsed = datetime.strptime(candle_time, "%Y-%m-%d %H:%M:%S")
+                now = parsed.replace(tzinfo=timezone.utc)
+            except Exception:
+                now = datetime.now(timezone.utc)
+    else:
+        now = datetime.now(timezone.utc)
+
     signal_id = now.strftime("%Y%m%dT%H%M%SZ")
 
     # Soft-RSI confidence. Positive value = how far past the threshold.

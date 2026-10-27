@@ -52,9 +52,17 @@ class CandleBuilder:
             self.current = self._new(bucket, price)
             return
 
+        # Guard against stale/out-of-order ticks from network jitter
+        if bucket < self.current["timestamp"]:
+            log.debug("Discarding stale tick timestamp %d (current %d)", timestamp, self.current["timestamp"])
+            return
+
         if bucket > self.current["timestamp"]:
             closed = self.current
             self.current = self._new(bucket, price)
+            time_gap = bucket - closed["timestamp"]
+            if time_gap > self.interval * 3:
+                log.warning("Data gap of %ds detected before tick — stream resumed", time_gap)
             self.on_close(closed)
         else:
             c = self.current

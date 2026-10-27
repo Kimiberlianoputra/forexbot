@@ -51,6 +51,50 @@ def _to_dataframe(candles: list[dict]) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
 
+def prime_history(api_key: str, symbol: str, interval: str, outputsize: int = 250) -> int:
+    """
+    Pre-fill the rolling candle history using 1 REST call on startup.
+    This eliminates the ~105-minute cold-start warm-up delay and costs
+    only 1 API credit (out of 800 free credits/day).
+    """
+    import requests
+    log.info("Priming candle history from Twelve Data (%d bars, 1 credit)...", outputsize)
+    try:
+        resp = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "outputsize": outputsize,
+                "apikey": api_key,
+                "order": "ASC",
+            },
+            timeout=20,
+        )
+        data = resp.json()
+        if data.get("status") == "error":
+            log.warning("Could not prime history: %s. Starting cold.", data.get("message"))
+            return 0
+        values = data.get("values", [])
+        for v in values:
+            try:
+                ts = int(pd.to_datetime(v["datetime"]).timestamp())
+            except Exception:
+                ts = None
+            _append_candle({
+                "timestamp": ts,
+                "datetime": v["datetime"],
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+            })
+        log.info("✓ Primed %d candles. Indicators (EMA, RSI, ADX) ready immediately.", len(_candles))
+        return len(values)
+    except Exception as exc:
+        log.warning("History priming request failed: %s. Starting cold.", exc)
+        return 0
+
 def on_candle_close(candle: dict) -> None:
     """Called whenever a candle closes. Evaluates the strategy."""
     global _last_alert_bar_ts
@@ -95,9 +139,12 @@ def on_candle_close(candle: dict) -> None:
         timeframe=config.INTERVAL,
     )
 
+    # 1. SEND TELEGRAM IMMEDIATELY (highest priority, no disk lag)
+    send_telegram(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID, message)
+
     log.info("🚨 %s SIGNAL @ %.2f — %s", result.signal, result.price, result.reason)
 
-    # ── NEW: log the signal to signals.csv for the outcome tracker ──
+    # 2. Log signal to signals.csv with exact candle close time
     try:
         rsi_threshold = (
             config.RSI_OVERSOLD if result.signal == "BUY" else config.RSI_OVERBOUGHT
@@ -110,12 +157,13 @@ def on_candle_close(candle: dict) -> None:
             ema=result.ema,
             body_ratio=result.body_ratio,
             rsi_threshold=rsi_threshold,
+            candle_time=bar_ts,
         )
         log.info("Logged signal to signals.csv")
     except Exception:
         log.exception("Failed to write signal to signals.csv")
 
-    send_telegram(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID, message)
+    # 3. Desktop notification (non-blocking)
     send_desktop(
         f"{result.signal} {config.SYMBOL}",
         f"{result.price:.2f} — {result.reason}",
@@ -142,6 +190,9 @@ def run_bot() -> int:
         config.BODY_RATIO_MIN,
         config.BODY_RATIO_MAX,
     )
+
+    # Prime historical candles once on boot (1 REST credit)
+    prime_history(config.TWELVE_DATA_API_KEY, config.SYMBOL, config.INTERVAL, outputsize=250)
 
     if config.DATA_MODE == "websocket":
         feed = WebSocketFeed(
