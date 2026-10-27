@@ -1,0 +1,22 @@
+[Unit]
+Description=XAU/USD Outcome Tracker
+Documentation=file:%h/Downloads/xauusd-signal-bot/TRACKER.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Downloads/xauusd-signal-bot
+EnvironmentFile=%h/Downloads/xauusd-signal-bot/.env
+ExecStart=%h/Downloads/xauusd-signal-bot/venv/bin/python %h/Downloads/xauusd-signal-bot/outcome_tracker.py
+Restart=on-failure
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
