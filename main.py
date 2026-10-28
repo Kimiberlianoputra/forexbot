@@ -137,6 +137,11 @@ def on_candle_close(candle: dict) -> None:
         price=result.price,
         reason=result.reason,
         timeframe=config.INTERVAL,
+        rsi=result.rsi,
+        adx=result.adx,
+        ema=result.ema,
+        body_ratio=result.body_ratio,
+        setup_time=result.setup_time,
     )
 
     # 1. SEND TELEGRAM IMMEDIATELY (highest priority, no disk lag)

@@ -101,23 +101,149 @@ def send_desktop(title: str, message: str) -> None:
     except Exception as exc:  # noqa: BLE001
         log.debug("Desktop notification failed: %s", exc)
 
+def calculate_confidence(
+    direction: str,
+    rsi: float | None,
+    adx: float | None,
+    body_ratio: float | None,
+) -> tuple[int, str, str, str]:
+    """
+    Calculate setup confidence (0-100%) based on outcome_tracker and report.py data:
+      1. Directional bias: SELL historically has strong trend alignment,
+         whereas BUY has been counter-trend pullback.
+      2. RSI extension depth: Matches report.py soft-RSI proximity breakdown:
+         - 5+ pts beyond threshold: 66.7% win rate (highest tier)
+         - 2-5 pts: 20% win rate
+         - 0-2 pts: marginal
+      3. ADX conviction: Higher ADX confirms trend energy.
+      4. Body ratio: 0.8x - 1.2x indicates a clean 1:1 reversal candle.
+
+    Returns:
+      (score_pct, emoji_bar, rating_label, explanation)
+    """
+    if rsi is None or adx is None:
+        return 50, "🟨🟨🟨⬜⬜", "MODERATE", "Standard conditions met"
+
+    score = 0
+
+    # 1. Directional historical factor (0 to 35 pts)
+    if direction == "SELL":
+        score += 35
+        dir_desc = "Trend-aligned SELL"
+    else:
+        score += 10
+        dir_desc = "Counter-trend dip BUY"
+
+    # 2. RSI extension past threshold (0 to 35 pts)
+    if direction == "BUY":
+        rsi_dist = max(0.0, 20.0 - rsi)
+    else:
+        rsi_dist = max(0.0, rsi - 80.0)
+
+    if rsi_dist >= 10.0:
+        score += 35
+        rsi_desc = f"+{rsi_dist:.1f} pts deep exhaustion (Top Tier)"
+    elif rsi_dist >= 5.0:
+        score += 25
+        rsi_desc = f"+{rsi_dist:.1f} pts beyond threshold (Strong Tier)"
+    elif rsi_dist >= 2.0:
+        score += 15
+        rsi_desc = f"+{rsi_dist:.1f} pts moderate extension"
+    else:
+        score += 5
+        rsi_desc = f"+{rsi_dist:.1f} pts marginal extension"
+
+    # 3. ADX strength (0 to 20 pts)
+    if adx >= 45.0:
+        score += 20
+        adx_desc = f"ADX {adx:.1f} (Extreme Momentum)"
+    elif adx >= 35.0:
+        score += 15
+        adx_desc = f"ADX {adx:.1f} (Solid Trend)"
+    else:
+        score += 10
+        adx_desc = f"ADX {adx:.1f} (Active)"
+
+    # 4. Body ratio health (0 to 10 pts)
+    ratio = body_ratio if body_ratio is not None else 1.0
+    if 0.8 <= ratio <= 1.2:
+        score += 10
+    else:
+        score += 5
+
+    score = max(5, min(99, score))
+
+    # Visual blocks (5 bars)
+    filled = round(score / 20)
+    filled = max(1, min(5, filled))
+    if score >= 75:
+        bar = "🟩" * filled + "⬜" * (5 - filled)
+        rating = "HIGH"
+    elif score >= 50:
+        bar = "🟨" * filled + "⬜" * (5 - filled)
+        rating = "MODERATE"
+    else:
+        bar = "🟧" * filled + "⬜" * (5 - filled)
+        rating = "CAUTIOUS"
+
+    explanation = f"{dir_desc} • {rsi_desc}"
+    return score, bar, rating, explanation
+
 def format_signal_message(
     signal: str,
     symbol: str,
     price: float,
-    reason: str,
+    reason: str = "",
     timeframe: str = "1min",
+    rsi: float | None = None,
+    adx: float | None = None,
+    ema: float | None = None,
+    body_ratio: float | None = None,
+    setup_time: str | None = None,
+    tp_dollars: float = 7.50,
+    sl_dollars: float = 5.00,
 ) -> str:
-    """Build a clean Telegram message for a signal. All dynamic content
-    is HTML-escaped so characters like `<`, `>`, `&` cannot break the
-    parse."""
+    """Build an enhanced Telegram message with trade targets and confidence meter."""
     emoji = "🟢" if signal == "BUY" else "🔴"
     action = "BUY" if signal == "BUY" else "SELL"
 
-    return (
-        f"{emoji} <b>{_esc(action)} SIGNAL — {_esc(symbol)}</b>\n"
-        f"<b>Timeframe:</b> {_esc(timeframe)}\n"
-        f"<b>Price:</b> {_esc(f'{price:.2f}')}\n"
-        f"<b>Reason:</b> {_esc(reason)}\n"
-        f"\n<i>Not financial advice.</i>"
-    )
+    # Calculate TP and SL prices
+    if signal == "BUY":
+        tp_price = price + tp_dollars
+        sl_price = price - sl_dollars
+    else:
+        tp_price = price - tp_dollars
+        sl_price = price + sl_dollars
+
+    score, bar, rating, explanation = calculate_confidence(signal, rsi, adx, body_ratio)
+
+    lines = [
+        f"{emoji} <b>{_esc(action)} SIGNAL — {_esc(symbol)}</b>",
+        f"⏱ <b>Timeframe:</b> {_esc(timeframe)}" + (f" | <b>Time:</b> {_esc(setup_time)}" if setup_time else ""),
+        "",
+        "<b>📋 Trade Plan:</b>",
+        f"💵 <b>Entry:</b> ${_esc(f'{price:.2f}')}",
+        f"🎯 <b>Take Profit (TP):</b> ${_esc(f'{tp_price:.2f}')} ({'+' if signal == 'BUY' else '-'}${tp_dollars:.2f})",
+        f"🛑 <b>Stop Loss (SL):</b> ${_esc(f'{sl_price:.2f}')} ({'-' if signal == 'BUY' else '+'}${sl_dollars:.2f})",
+        f"⚖️ <b>Risk/Reward:</b> 1 : {tp_dollars / sl_dollars:.1f}",
+        "",
+        "<b>📊 Confidence Meter:</b>",
+        f"{bar} <b>{score}% — {rating}</b>",
+        f"<i>{_esc(explanation)}</i>",
+    ]
+
+    # Add indicator breakdown if available
+    if rsi is not None and adx is not None and ema is not None:
+        lines.extend([
+            "",
+            "<b>📈 Key Indicators:</b>",
+            f"• <b>RSI(3):</b> {_esc(f'{rsi:.1f}')} ({'Oversold' if signal == 'BUY' else 'Overbought'})",
+            f"• <b>ADX(5):</b> {_esc(f'{adx:.1f}')} (Trend Strength)",
+            f"• <b>EMA(100):</b> {_esc(f'{ema:.2f}')} (Price {'Above' if price > ema else 'Below'})",
+            f"• <b>Body Ratio:</b> {_esc(f'{body_ratio:.2f}x' if body_ratio else '1.0x')}",
+        ])
+    elif reason:
+        lines.extend(["", f"<b>Reason:</b> {_esc(reason)}"])
+
+    lines.extend(["", "<i>XAU/USD Bot • Not financial advice.</i>"])
+    return "\n".join(lines)
