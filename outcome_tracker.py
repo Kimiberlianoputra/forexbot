@@ -30,12 +30,12 @@ TP_DOLLARS = 7.50
 SL_DOLLARS = 5.00
 HALF_SPREAD = 0.025                  # $0.05 total spread / 2
 TWO_HS = 2 * HALF_SPREAD             # 0.05 round-trip spread cost
-TIMEOUT_BARS = 30
+TIMEOUT_BARS = 60                     # 60 bars (1 hour trade timeout)
 
 # ── Fetch settings ────────────────────────────────────────────────────
 BAR_INTERVAL = "1min"
-FORWARD_BARS = 60                     # need +60 min of data
-RESOLVE_AFTER_MIN = 70                # wait this long before resolving
+FORWARD_BARS = 75                     # fetch +75 min of data to cover full 60 bars
+RESOLVE_AFTER_MIN = 80                # wait 80 min before resolving to ensure bars are closed
 STALE_AFTER_HOURS = 168                # older than this -> unresolvable
 
 # ── Output columns ────────────────────────────────────────────────────

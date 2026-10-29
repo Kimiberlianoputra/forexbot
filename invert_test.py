@@ -24,7 +24,7 @@ TP = 7.50
 SL = 5.00
 HALF_SPREAD = 0.025  # $0.05 spread / 2
 TWO_HS = HALF_SPREAD * 2
-TIMEOUT_BARS = 30
+TIMEOUT_BARS = 60    # 1 hour timeout (60 1-minute bars)
 
 def fetch_bars(signal_time):
     start = signal_time - timedelta(minutes=2)
@@ -32,7 +32,7 @@ def fetch_bars(signal_time):
         "symbol": config.SYMBOL,
         "interval": "1min",
         "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
-        "outputsize": 40,
+        "outputsize": 75,
         "apikey": config.TWELVE_DATA_API_KEY,
         "order": "ASC",
         "timezone": "UTC",

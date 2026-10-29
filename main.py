@@ -131,6 +131,11 @@ def on_candle_close(candle: dict) -> None:
         return
     _last_alert_bar_ts = bar_ts
 
+    # 0. SAFETY KILL SWITCH (Instant freeze for real trading)
+    if config.KILL_SWITCH:
+        log.warning("🛑 KILL SWITCH ACTIVE: %s signal @ %.2f suppressed.", result.signal, result.price)
+        return
+
     message = format_signal_message(
         signal=result.signal,
         symbol=config.SYMBOL,
@@ -267,11 +272,23 @@ def run_test() -> int:
         log.error("Twelve Data request failed: %s", exc)
         return 1
 
-    log.info("Sending test Telegram message…")
+    log.info("Sending test Telegram message (previewing new enhanced format)…")
+    current_price = float(data.get("close") or 4025.00)
+    sample_card = format_signal_message(
+        signal="SELL",
+        symbol=config.SYMBOL,
+        price=current_price,
+        timeframe=config.INTERVAL,
+        rsi=88.5,
+        adx=36.0,
+        ema=current_price + 3.50,
+        body_ratio=1.0,
+        setup_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    )
     ok = send_telegram(
         config.TELEGRAM_BOT_TOKEN,
         config.TELEGRAM_CHAT_ID,
-        "✅ <b>XAU/USD Signal Bot</b>\nTest message — your bot is wired up correctly.",
+        "🧪 <b>TEST ALERT (PREVIEW OF NEW CARD FORMAT)</b>\n\n" + sample_card,
     )
     if not ok:
         return 1

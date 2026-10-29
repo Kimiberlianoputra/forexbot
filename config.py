@@ -55,6 +55,13 @@ BODY_RATIO_MAX: float = _get_float("BODY_RATIO_MAX", 1.5)
 # Minimum bars needed before indicators are valid
 MIN_BARS: int = max(EMA_PERIOD, ADX_PERIOD * 2, RSI_PERIOD * 2) + 5
 
+# ── Safety / Kill Switch Reminder ────────────────────────────
+# If you ever connect this bot to real broker execution (e.g. MetaTrader/cTrader/ccxt):
+# Set KILL_SWITCH=true in .env to immediately freeze all trading actions.
+KILL_SWITCH: bool = os.getenv("KILL_SWITCH", "false").strip().lower() in ("true", "1", "yes")
+MAX_CONSECUTIVE_LOSSES: int = _get_int("MAX_CONSECUTIVE_LOSSES", 3)
+MAX_DAILY_DRAWDOWN_USD: float = _get_float("MAX_DAILY_DRAWDOWN_USD", 50.0)
+
 def validate() -> list[str]:
     """Return a list of configuration problems (empty = OK)."""
     problems: list[str] = []

@@ -5,7 +5,7 @@ they fire.
 
 The bot logs each signal to `signals.csv`. The tracker reads that file,
 fetches the following 1-minute bars from Twelve Data, simulates the trade
-(spread-adjusted, TP/SL, 30-min timeout), and writes the result to
+(spread-adjusted, TP/SL, 60-min / 1-hour timeout), and writes the result to
 `outcomes.csv`. `report.py` turns that CSV into a summary.
 
 ---
