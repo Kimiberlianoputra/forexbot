@@ -55,6 +55,62 @@ def _bar(label: str, value, width: int = 38) -> None:
 def _pct(n: int, d: int) -> str:
     return "n/a" if d == 0 else f"{100.0 * n / d:.1f}%"
 
+def format_telegram_report(path: str = DEFAULT_CSV) -> str:
+    """Format outcomes.csv into a clean, rich Telegram HTML message."""
+    if not os.path.exists(path):
+        return "📊 <b>Outcome Report</b>\nNo outcomes.csv file found yet. (Wait for tracker to resolve trades)."
+
+    rows = _load(path)
+    if not rows:
+        return "📊 <b>Outcome Report</b>\noutcomes.csv is empty."
+
+    wins = [r for r in rows if r.get("outcome") == "win"]
+    losses = [r for r in rows if r.get("outcome") == "loss"]
+    timeouts = [r for r in rows if r.get("outcome") == "timeout"]
+    ambiguous = [r for r in rows if r.get("outcome") == "ambiguous"]
+    unresolvable = [r for r in rows if r.get("outcome") == "unresolvable"]
+
+    resolved = wins + losses + timeouts + ambiguous
+    clean = wins + losses
+    with_pnl = wins + losses + timeouts
+
+    lines = [
+        "📊 <b>XAU/USD Bot — Performance Report</b>",
+        "",
+        f"<b>Total Signals:</b> {len(rows)} ({len(resolved)} resolved)",
+        f"🏆 <b>Win Rate:</b> {_pct(len(wins), len(clean))} ({len(wins)}W / {len(losses)}L)",
+        f"⏳ <b>Timeouts:</b> {len(timeouts)}",
+    ]
+
+    pnls = [_num(r.get("pnl_dollars")) for r in with_pnl]
+    if pnls:
+        total = sum(pnls)
+        exp = total / len(pnls)
+        pnl_emoji = "🟢" if total >= 0 else "🔴"
+        lines.append(f"{pnl_emoji} <b>Cumulative P&L:</b> {total:+.2f} USD")
+        lines.append(f"📈 <b>Expectancy:</b> {exp:+.2f} USD / trade")
+
+    lines.append("")
+    lines.append("<b>Breakdown by Direction:</b>")
+    for d in ("SELL", "BUY"):
+        sub = [r for r in rows if r.get("direction") == d]
+        w = [r for r in sub if r.get("outcome") == "win"]
+        l = [r for r in sub if r.get("outcome") == "loss"]
+        pnl_vals = [_num(r.get("pnl_dollars"))
+                    for r in sub if r.get("outcome") in ("win", "loss", "timeout")]
+        avg = sum(pnl_vals) / len(pnl_vals) if pnl_vals else 0.0
+        icon = "🔴" if d == "SELL" else "🟢"
+        lines.append(
+            f"{icon} <b>{d}:</b> {len(w)}W / {len(l)}L ({_pct(len(w), len(w) + len(l))}) | avg {avg:+.2f} USD"
+        )
+
+    times = [t for t in (_parse_time(r.get("signal_time_utc")) for r in rows) if t]
+    if times:
+        lines.append("")
+        lines.append(f"<i>Period: {min(times).strftime('%Y-%m-%d')} → {max(times).strftime('%Y-%m-%d')} UTC</i>")
+
+    return "\n".join(lines)
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default=DEFAULT_CSV)

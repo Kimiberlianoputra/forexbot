@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import logging
 import os
 import sys
@@ -26,8 +27,9 @@ SIGNALS_FILE = os.path.join(_HERE, "signals.csv")
 OUTCOMES_FILE = os.path.join(_HERE, "outcomes.csv")
 
 # ── Trade parameters (locked spec) ────────────────────────────────────
-TP_DOLLARS = 7.50
-SL_DOLLARS = 5.00
+# TP/SL defaults now live in config.py (single source of truth shared with
+# the notifier). signals.csv rows written by the new bot carry their own
+# tp_dollars / sl_dollars; older rows fall back to config defaults.
 HALF_SPREAD = 0.025                  # $0.05 total spread / 2
 TWO_HS = 2 * HALF_SPREAD             # 0.05 round-trip spread cost
 TIMEOUT_BARS = 60                     # 60 bars (1 hour trade timeout)
@@ -37,6 +39,22 @@ BAR_INTERVAL = "1min"
 FORWARD_BARS = 75                     # fetch +75 min of data to cover full 60 bars
 RESOLVE_AFTER_MIN = 80                # wait 80 min before resolving to ensure bars are closed
 STALE_AFTER_HOURS = 168                # older than this -> unresolvable
+
+# Free plan is capped at 8 REST credits/minute. One resolve = 1 credit, so
+# sleeping 8s between fetches keeps a catch-up pass at ~7.5 credits/min —
+# under the limit even when resolving a large backlog after downtime.
+RATE_LIMIT_SLEEP = 8                  # seconds between Twelve Data fetches
+MAX_FETCH_ATTEMPTS = 5                # give up on a signal after this many failed fetches
+
+class FetchRetry(Exception):
+    """Transient fetch failure (network blip / 429 / 5xx) — retry next pass.
+
+    A momentary outage must not permanently mark a signal 'unresolvable':
+    that would silently erase real outcomes from the stats.
+    """
+
+# signal_id -> consecutive failed fetch attempts (persists across passes)
+_fetch_failures: dict[str, int] = {}
 
 # ── Output columns ────────────────────────────────────────────────────
 FIELDS = [
@@ -106,11 +124,24 @@ def _append_outcome(row: dict) -> None:
         w.writerow({k: row.get(k, "") for k in FIELDS})
 
 def _fetch_bars(signal_time: datetime) -> list[dict]:
+    """
+    Fetch the bars that follow a signal.
+
+    IMPORTANT: end_date must be given explicitly. With only start_date +
+    outputsize, Twelve Data returns the most RECENT bars in the window —
+    which silently resolved old signals against bars from days later and
+    fabricated win/loss outcomes.
+    """
     start = signal_time - timedelta(minutes=2)
+    end = signal_time + timedelta(minutes=FORWARD_BARS + 5)
+    now = datetime.now(timezone.utc)
+    if end > now:
+        end = now
     params = {
         "symbol": config.SYMBOL,
         "interval": BAR_INTERVAL,
         "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
         "outputsize": FORWARD_BARS + 30,
         "apikey": config.TWELVE_DATA_API_KEY,
         "order": "ASC",
@@ -134,14 +165,26 @@ def _resolve_one(sig: dict) -> dict:
     entry_mid = float(sig["price_mid"])
     rsi_distance = sig.get("rsi_distance", "")
 
+    # Per-signal TP/SL. New signal rows carry them; older rows have blanks,
+    # in which case we fall back to the config defaults.
+    def _csv_float(v, fallback):
+        try:
+            f = float(v)
+            return f if f > 0 else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    tp_d = _csv_float(sig.get("tp_dollars"), config.TP_DOLLARS)
+    sl_d = _csv_float(sig.get("sl_dollars"), config.SL_DOLLARS)
+
     if direction == "BUY":
         entry_fill = entry_mid + HALF_SPREAD
-        tp_trigger = entry_mid + TP_DOLLARS + TWO_HS
-        sl_trigger = entry_mid - SL_DOLLARS + TWO_HS
+        tp_trigger = entry_mid + tp_d + TWO_HS
+        sl_trigger = entry_mid - sl_d + TWO_HS
     else:
         entry_fill = entry_mid - HALF_SPREAD
-        tp_trigger = entry_mid - TP_DOLLARS - TWO_HS
-        sl_trigger = entry_mid + SL_DOLLARS - TWO_HS
+        tp_trigger = entry_mid - tp_d - TWO_HS
+        sl_trigger = entry_mid + sl_d - TWO_HS
 
     base = {
         "signal_id": sig_id,
@@ -157,10 +200,9 @@ def _resolve_one(sig: dict) -> dict:
     try:
         raw = _fetch_bars(signal_time)
     except Exception as exc:
-        log.warning("Fetch failed for %s: %s", sig_id, exc)
-        base["outcome"] = "unresolvable"
-        base["note"] = f"fetch failed: {exc}"
-        return base
+        # Transient failure (timeout, 429 rate limit, 5xx). Raise so run_once
+        # can retry on a later pass instead of burning the outcome forever.
+        raise FetchRetry(f"{sig_id}: {exc}") from exc
 
     t0 = _truncate_minute(signal_time)
     bars: list[dict] = []
@@ -177,6 +219,15 @@ def _resolve_one(sig: dict) -> dict:
                 "low": float(b["low"]),
                 "close": float(b["close"]),
             })
+
+    # Sanity check: the first forward bar must sit right after the signal.
+    # If it doesn't, the fetch returned a misaligned window and any outcome
+    # built from it would be fiction (see the 2026-10-20/21 corrupted rows).
+    if not bars or (bars[0]["time"] - t0) > timedelta(minutes=5):
+        first = bars[0]["time"].isoformat() if bars else "none"
+        base["outcome"] = "unresolvable"
+        base["note"] = f"fetch misaligned: first bar {first} vs signal {t0.isoformat()}"
+        return base
 
     if len(bars) < TIMEOUT_BARS:
         base["outcome"] = "unresolvable"
@@ -220,9 +271,9 @@ def _resolve_one(sig: dict) -> dict:
             break
 
     if outcome == "win":
-        pnl = TP_DOLLARS
+        pnl = tp_d
     elif outcome == "loss":
-        pnl = -SL_DOLLARS
+        pnl = -sl_d
     elif outcome == "ambiguous":
         pnl = 0.0
     else:
@@ -276,7 +327,35 @@ def run_once() -> int:
             processed += 1
             continue
 
-        row = _resolve_one(sig)
+        try:
+            row = _resolve_one(sig)
+        except FetchRetry as exc:
+            tries = _fetch_failures.get(sig_id, 0) + 1
+            _fetch_failures[sig_id] = tries
+            if tries >= MAX_FETCH_ATTEMPTS:
+                # API is down for real (or signal is cursed) — stop retrying,
+                # cap the credit waste at MAX_FETCH_ATTEMPTS per signal.
+                _append_outcome({
+                    "signal_id": sig_id,
+                    "signal_time_utc": sig_time.isoformat(),
+                    "direction": sig["direction"],
+                    "outcome": "unresolvable",
+                    "note": f"fetch failed {tries}x: {exc}",
+                    "rsi_distance": sig.get("rsi_distance", ""),
+                })
+                resolved.add(sig_id)
+                _fetch_failures.pop(sig_id, None)
+                processed += 1
+                log.error("Gave up on %s after %d failed fetches", sig_id, tries)
+            else:
+                log.warning(
+                    "Fetch failed for %s (attempt %d/%d) — retrying next pass",
+                    sig_id, tries, MAX_FETCH_ATTEMPTS,
+                )
+            time.sleep(RATE_LIMIT_SLEEP)
+            continue
+
+        _fetch_failures.pop(sig_id, None)
         _append_outcome(row)
         resolved.add(sig_id)
         processed += 1
@@ -289,13 +368,22 @@ def run_once() -> int:
             row.get("pnl_pips", "?"),
         )
 
-        time.sleep(1)
+        time.sleep(RATE_LIMIT_SLEEP)
 
     if processed:
         log.info("Processed %d signal(s) this pass", processed)
     return processed
 
 def main() -> int:
+    # Single-instance guard: the systemd service plus a manual run used to
+    # append duplicate outcome rows (both passes resolved the same signals).
+    lock_fh = open(os.path.join(_HERE, ".tracker.lock"), "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.error("Another outcome_tracker instance is already running — exiting.")
+        return 1
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Run one pass then exit")
     parser.add_argument("--interval", type=int, default=300, help="Seconds between passes (default 300)")

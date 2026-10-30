@@ -38,12 +38,30 @@ CandleCallback = Callable[[dict], None]
 # Candle builder (WebSocket mode)
 # ─────────────────────────────────────────────────────────────
 class CandleBuilder:
-    """Aggregates ticks into fixed-interval OHLC candles."""
+    """Aggregates ticks into fixed-interval OHLC candles.
 
-    def __init__(self, interval_seconds: int, on_close: CandleCallback):
+    Candle integrity: free-tier WS feeds deliver ticks in sparse bursts, which
+    can fabricate candles that never existed (e.g. a "red close" built from a
+    stale tick while the market actually rallied). Every closed candle carries:
+      ticks     — how many ticks the candle saw
+      complete  — False if a minute-gap occurred inside it OR it saw fewer
+                  than min_ticks ticks. main.py drops incomplete candles.
+    """
+
+    def __init__(self, interval_seconds: int, on_close: CandleCallback, min_ticks: int = 2):
         self.interval = interval_seconds
         self.on_close = on_close
+        self.min_ticks = max(1, min_ticks)
         self.current: Optional[dict] = None
+
+    def latest_price(self) -> Optional[float]:
+        """Most recent tick price (the forming candle's close), or None."""
+        if self.current is None:
+            return None
+        try:
+            return float(self.current["close"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def add_tick(self, price: float, timestamp: int) -> None:
         bucket = (timestamp // self.interval) * self.interval
@@ -59,20 +77,30 @@ class CandleBuilder:
 
         if bucket > self.current["timestamp"]:
             closed = self.current
+            gap = bucket - closed["timestamp"]
             self.current = self._new(bucket, price)
-            time_gap = bucket - closed["timestamp"]
-            if time_gap > self.interval * 3:
-                log.warning("Data gap of %ds detected before tick — stream resumed", time_gap)
+            if gap > self.interval * 3:
+                log.warning("Data gap of %ds detected before tick — stream resumed", gap)
+            # Integrity flags: trustworthy only if the stream was continuous
+            # during the candle AND it saw a sane number of ticks.
+            closed["complete"] = (gap <= self.interval) and (closed["ticks"] >= self.min_ticks)
+            if not closed["complete"]:
+                log.warning(
+                    "Incomplete candle @ %d (%d tick(s), gap %ds) — will be dropped",
+                    closed["timestamp"], closed["ticks"], gap,
+                )
             self.on_close(closed)
         else:
             c = self.current
             c["high"] = max(c["high"], price)
             c["low"] = min(c["low"], price)
             c["close"] = price
+            c["ticks"] += 1
 
     def flush(self) -> None:
-        """Emit the in-progress candle (used on shutdown)."""
+        """Emit the in-progress candle (used on shutdown). Always incomplete."""
         if self.current is not None:
+            self.current["complete"] = False
             self.on_close(self.current)
             self.current = None
 
@@ -84,6 +112,7 @@ class CandleBuilder:
             "high": price,
             "low": price,
             "close": price,
+            "ticks": 1,
         }
 
 # ─────────────────────────────────────────────────────────────
@@ -98,12 +127,16 @@ class WebSocketFeed:
         symbol: str,
         interval_seconds: int,
         on_candle_close: CandleCallback,
+        min_ticks: int = 2,
     ):
         self.api_key = api_key
         self.symbol = symbol
-        self.builder = CandleBuilder(interval_seconds, on_candle_close)
+        self.builder = CandleBuilder(interval_seconds, on_candle_close, min_ticks=min_ticks)
         self._stop = False
         self.ws: Optional[websocket.WebSocketApp] = None
+
+    def get_live_price(self) -> Optional[float]:
+        return self.builder.latest_price()
 
     # ── WebSocketApp callbacks ───────────────────────────────
     def _on_open(self, ws) -> None:
@@ -214,6 +247,11 @@ class RESTFeed:
         self.on_candle_close = on_candle_close
         self._stop = False
         self._last_closed_ts: Optional[str] = None
+        self._latest_price: Optional[float] = None
+
+    def get_live_price(self) -> Optional[float]:
+        """Close of the most recent (possibly forming) REST bar, or None."""
+        return self._latest_price
 
     # ── HTTP ─────────────────────────────────────────────────
     def _fetch(self, outputsize: int = 2) -> list[dict]:
@@ -250,6 +288,13 @@ class RESTFeed:
 
             try:
                 values = self._fetch(outputsize=2)
+
+                # Track the latest traded price for live-price display
+                if values:
+                    try:
+                        self._latest_price = float(values[-1]["close"])
+                    except (KeyError, TypeError, ValueError):
+                        pass
 
                 # values[-1] is the currently-forming candle.
                 # values[-2] is the last fully-closed candle.

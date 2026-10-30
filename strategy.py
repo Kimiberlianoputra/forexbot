@@ -51,6 +51,7 @@ class SignalResult:
     body_ratio: float   # trigger body / setup body
     setup_time: str
     trigger_time: str
+    atr: float | None = None  # setup-bar ATR (for volatility-scaled TP/SL)
 
 def _body(row: pd.Series) -> float:
     return abs(float(row["close"]) - float(row["open"]))
@@ -106,6 +107,11 @@ def check_signal(df: pd.DataFrame) -> Optional[SignalResult]:
     trigger_ema = float(trigger["ema"])
     setup_rsi = float(setup["rsi"])
     setup_adx = float(setup["adx"])
+    setup_atr = (
+        float(setup["atr"])
+        if "atr" in df.columns and pd.notna(setup.get("atr"))
+        else None
+    )
 
     setup_body = _body(setup)
     trigger_body = _body(trigger)
@@ -139,6 +145,7 @@ def check_signal(df: pd.DataFrame) -> Optional[SignalResult]:
             body_ratio=ratio,
             setup_time=setup_time,
             trigger_time=trigger_time,
+            atr=setup_atr,
         )
 
     # ── SELL ─────────────────────────────────────────────────
@@ -166,6 +173,7 @@ def check_signal(df: pd.DataFrame) -> Optional[SignalResult]:
             body_ratio=ratio,
             setup_time=setup_time,
             trigger_time=trigger_time,
+            atr=setup_atr,
         )
 
     return None

@@ -93,6 +93,23 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Se
     dx = 100.0 * (plus_di - minus_di).abs() / denom
     return dx.ewm(alpha=alpha, adjust=False).mean().astype(float)
 
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """
+    Average True Range using Wilder's smoothing.
+
+    Used for volatility-scaled TP/SL (config TP_SL_MODE="atr").
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean().astype(float)
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Attach ema, rsi, adx columns to a copy of df.
@@ -104,6 +121,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ema"] = ema(out["close"], period=_ema_period())
     out["rsi"] = rsi(out["close"], period=_rsi_period())
     out["adx"] = adx(out["high"], out["low"], out["close"], period=_adx_period())
+    out["atr"] = atr(out["high"], out["low"], out["close"], period=_atr_period())
     return out
 
 # Late imports to avoid circular dependency with config at module import time.
@@ -118,3 +136,7 @@ def _rsi_period() -> int:
 def _adx_period() -> int:
     from config import ADX_PERIOD
     return ADX_PERIOD
+
+def _atr_period() -> int:
+    from config import ATR_PERIOD
+    return ATR_PERIOD

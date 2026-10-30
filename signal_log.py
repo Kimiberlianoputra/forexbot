@@ -22,8 +22,11 @@ Layout of signals.csv (one row per fired signal):
 from __future__ import annotations
 
 import csv
+import logging
 import os
 from datetime import datetime, timezone
+
+log = logging.getLogger(__name__)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SIGNALS_FILE = os.path.join(_HERE, "signals.csv")
@@ -40,7 +43,35 @@ FIELDS = [
     "body_ratio",
     "rsi_threshold",
     "rsi_distance",
+    "atr",
+    "tp_dollars",
+    "sl_dollars",
 ]
+
+
+def _ensure_schema() -> None:
+    """Migrate signals.csv if written by an older version (fewer columns).
+
+    Old rows get empty cells for the new fields; outcome_tracker falls back to
+    config defaults for TP/SL when those cells are blank.
+    """
+    if not os.path.exists(SIGNALS_FILE):
+        return
+    with open(SIGNALS_FILE, newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] == FIELDS:
+        return
+    migrated = [FIELDS]
+    for r in rows[1:]:
+        if not r:
+            continue
+        r = list(r) + [""] * (len(FIELDS) - len(r))
+        migrated.append(r[: len(FIELDS)])
+    tmp = SIGNALS_FILE + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        csv.writer(f).writerows(migrated)
+    os.replace(tmp, SIGNALS_FILE)
+    log.info("signals.csv migrated to %d-column schema", len(FIELDS))
 
 def record_signal(
     direction: str,
@@ -51,6 +82,9 @@ def record_signal(
     body_ratio: float,
     rsi_threshold: float,
     candle_time: datetime | str | int | float | None = None,
+    atr: float | None = None,
+    tp_dollars: float | None = None,
+    sl_dollars: float | None = None,
 ) -> str:
     """
     Append a signal to signals.csv and return its signal_id.
@@ -89,6 +123,8 @@ def record_signal(
     else:
         rsi_distance = float(rsi) - rsi_threshold
 
+    _ensure_schema()
+
     exists = os.path.exists(SIGNALS_FILE)
     with open(SIGNALS_FILE, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -106,6 +142,9 @@ def record_signal(
             "body_ratio": round(float(body_ratio), 3),
             "rsi_threshold": float(rsi_threshold),
             "rsi_distance": round(rsi_distance, 3),
+            "atr": round(float(atr), 3) if atr is not None else "",
+            "tp_dollars": round(float(tp_dollars), 2) if tp_dollars is not None else "",
+            "sl_dollars": round(float(sl_dollars), 2) if sl_dollars is not None else "",
         })
 
     return signal_id

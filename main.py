@@ -13,7 +13,8 @@ import argparse
 import logging
 import signal
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -37,6 +38,8 @@ log = logging.getLogger("xauusd-bot")
 MAX_HISTORY = 500
 _candles: list[dict] = []
 _last_alert_bar_ts: int | None = None
+_last_signal_epoch: float | None = None   # cooldown anchor (time.time())
+_feed = None                              # active feed object (for live price)
 
 def _append_candle(candle: dict) -> None:
     """Append a closed candle to the rolling history."""
@@ -68,6 +71,7 @@ def prime_history(api_key: str, symbol: str, interval: str, outputsize: int = 25
                 "outputsize": outputsize,
                 "apikey": api_key,
                 "order": "ASC",
+                "timezone": "UTC",
             },
             timeout=20,
         )
@@ -76,11 +80,19 @@ def prime_history(api_key: str, symbol: str, interval: str, outputsize: int = 25
             log.warning("Could not prime history: %s. Starting cold.", data.get("message"))
             return 0
         values = data.get("values", [])
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        kept = 0
         for v in values:
             try:
-                ts = int(pd.to_datetime(v["datetime"]).timestamp())
+                # Parse explicitly as UTC (naive parsing silently shifts on
+                # non-UTC servers — the API always returns UTC here).
+                ts = int(pd.to_datetime(v["datetime"], utc=True).timestamp())
             except Exception:
                 ts = None
+            if ts is not None and ts + config.CANDLE_INTERVAL_SECONDS > now_epoch:
+                # Skip the currently-forming candle — it is not closed yet and
+                # would poison the indicator history with a partial bar.
+                continue
             _append_candle({
                 "timestamp": ts,
                 "datetime": v["datetime"],
@@ -89,15 +101,26 @@ def prime_history(api_key: str, symbol: str, interval: str, outputsize: int = 25
                 "low": float(v["low"]),
                 "close": float(v["close"]),
             })
-        log.info("✓ Primed %d candles. Indicators (EMA, RSI, ADX) ready immediately.", len(_candles))
-        return len(values)
+            kept += 1
+        log.info("✓ Primed %d candles. Indicators (EMA, RSI, ADX) ready immediately.", kept)
+        return kept
     except Exception as exc:
         log.warning("History priming request failed: %s. Starting cold.", exc)
         return 0
 
 def on_candle_close(candle: dict) -> None:
     """Called whenever a candle closes. Evaluates the strategy."""
-    global _last_alert_bar_ts
+    global _last_alert_bar_ts, _last_signal_epoch
+
+    # Drop candles flagged incomplete by the feed (stream gap / too few ticks).
+    # A candle built from sparse or stale ticks can be pure fiction — feeding
+    # it to the strategy is how the phantom 2026-10-29 12:11 SELL happened.
+    if candle.get("complete") is False:
+        log.warning(
+            "Dropping incomplete candle @ %s (sparse ticks/gap) — not evaluating",
+            candle.get("timestamp"),
+        )
+        return
 
     _append_candle(candle)
 
@@ -132,21 +155,63 @@ def on_candle_close(candle: dict) -> None:
     _last_alert_bar_ts = bar_ts
 
     # 0. SAFETY KILL SWITCH (Instant freeze for real trading)
-    if config.KILL_SWITCH:
+    if config.is_kill_switch_active():
         log.warning("🛑 KILL SWITCH ACTIVE: %s signal @ %.2f suppressed.", result.signal, result.price)
         return
+
+    # 0a. Direction gates
+    if result.signal == "BUY" and not config.ENABLE_BUY:
+        log.info("BUY signals disabled (ENABLE_BUY=false) — suppressed")
+        return
+    if result.signal == "SELL" and not config.ENABLE_SELL:
+        log.info("SELL signals disabled (ENABLE_SELL=false) — suppressed")
+        return
+
+    # 0b. Cooldown against back-to-back signal spam
+    now_epoch = time.time()
+    if (
+        config.SIGNAL_COOLDOWN_SECONDS > 0
+        and _last_signal_epoch is not None
+        and now_epoch - _last_signal_epoch < config.SIGNAL_COOLDOWN_SECONDS
+    ):
+        log.info(
+            "Cooldown: %.0fs since last signal (< %ds) — %s suppressed",
+            now_epoch - _last_signal_epoch,
+            config.SIGNAL_COOLDOWN_SECONDS,
+            result.signal,
+        )
+        return
+
+    # 0c. REST confirmation guard — WS tick streams can be sparse/stale, so
+    # re-run the strategy on REST candles (source of truth) before alerting.
+    if config.CONFIRM_WITH_REST:
+        confirmed, note = _confirm_with_rest(result)
+        if not confirmed:
+            log.warning("🚫 Signal REJECTED by REST confirmation: %s", note)
+            return
+        if note:
+            log.info("REST confirmation: %s", note)
+
+    tp_dollars, sl_dollars = config.compute_tp_sl(result.atr)
+    _last_signal_epoch = time.time()
+
+    live_price = None
+    if _feed is not None and hasattr(_feed, "get_live_price"):
+        live_price = _feed.get_live_price()
 
     message = format_signal_message(
         signal=result.signal,
         symbol=config.SYMBOL,
         price=result.price,
-        reason=result.reason,
         timeframe=config.INTERVAL,
+        trigger_time=result.trigger_time,
+        live_price=live_price,
+        tp_dollars=tp_dollars,
+        sl_dollars=sl_dollars,
         rsi=result.rsi,
         adx=result.adx,
         ema=result.ema,
         body_ratio=result.body_ratio,
-        setup_time=result.setup_time,
     )
 
     # 1. SEND TELEGRAM IMMEDIATELY (highest priority, no disk lag)
@@ -168,6 +233,9 @@ def on_candle_close(candle: dict) -> None:
             body_ratio=result.body_ratio,
             rsi_threshold=rsi_threshold,
             candle_time=bar_ts,
+            atr=result.atr,
+            tp_dollars=tp_dollars,
+            sl_dollars=sl_dollars,
         )
         log.info("Logged signal to signals.csv")
     except Exception:
@@ -178,6 +246,73 @@ def on_candle_close(candle: dict) -> None:
         f"{result.signal} {config.SYMBOL}",
         f"{result.price:.2f} — {result.reason}",
     )
+
+REST_TIME_SERIES_URL = "https://api.twelvedata.com/time_series"
+
+def _confirm_with_rest(result) -> tuple[bool, str]:
+    """
+    Re-run the strategy on REST candles before alerting.
+
+    The free WebSocket tier delivers ticks in sparse bursts; the local candle
+    builder can therefore fabricate a candle that never existed (this produced
+    a phantom SELL @ 4024.95 on 2026-10-29 12:11 UTC while the real bar was
+    GREEN closing at 4026.79). REST candles are the source of truth, and
+    signals are rare (a few per day), so the extra credit per signal is cheap.
+
+    Returns (confirmed, note). On transient REST errors we fail OPEN (send
+    anyway) because a missed alert is worse than a delayed one for an
+    alert-only bot — set CONFIRM_WITH_REST=false to bypass entirely.
+    """
+    import requests as _rq
+    try:
+        resp = _rq.get(
+            REST_TIME_SERIES_URL,
+            params={
+                "symbol": config.SYMBOL,
+                "interval": config.INTERVAL,
+                "outputsize": max(config.MIN_BARS + 10, 120),
+                "apikey": config.TWELVE_DATA_API_KEY,
+                "order": "ASC",
+                "timezone": "UTC",
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("status") == "error":
+            return True, f"unavailable ({data.get('message')}) — sending unconfirmed"
+        values = data.get("values", [])
+        if len(values) < config.MIN_BARS:
+            return True, f"only {len(values)} REST bars — sending unconfirmed"
+
+        df = pd.DataFrame(values)
+        for col in ("open", "high", "low", "close"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+
+        # Drop the currently-forming last bar if it has not closed yet.
+        try:
+            last_dt = pd.to_datetime(df.iloc[-1]["datetime"])
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.tz_localize("UTC")
+            else:
+                last_dt = last_dt.tz_convert("UTC")
+            forming = (
+                last_dt + timedelta(seconds=config.CANDLE_INTERVAL_SECONDS)
+            ) > datetime.now(timezone.utc)
+        except Exception:
+            forming = True  # conservative: matches RESTFeed's assumption
+        if forming:
+            df = df.iloc[:-1].reset_index(drop=True)
+
+        df = compute_indicators(df)
+        rest_result = check_signal(df)
+        if rest_result is None:
+            return False, "REST candles do not reproduce the signal (phantom WS candle)"
+        if rest_result.signal != result.signal:
+            return False, f"REST says {rest_result.signal}, WS said {result.signal}"
+        return True, f"confirmed @ REST close {rest_result.price:.2f}"
+    except Exception as exc:  # noqa: BLE001
+        return True, f"unavailable ({exc}) — sending unconfirmed"
 
 # ── Modes ───────────────────────────────────────────────────
 def run_bot() -> int:
@@ -204,12 +339,22 @@ def run_bot() -> int:
     # Prime historical candles once on boot (1 REST credit)
     prime_history(config.TWELVE_DATA_API_KEY, config.SYMBOL, config.INTERVAL, outputsize=250)
 
+    # Start interactive Telegram command listener (/report, /kill, /unkill, /status)
+    from telegram_commands import start_command_listener
+    cmd_listener = start_command_listener(
+        token=config.TELEGRAM_BOT_TOKEN,
+        default_chat_id=config.TELEGRAM_CHAT_ID,
+        admin_chat_id=config.TELEGRAM_ADMIN_CHAT_ID,
+        get_candles=lambda: _candles,
+    )
+
     if config.DATA_MODE == "websocket":
         feed = WebSocketFeed(
             api_key=config.TWELVE_DATA_API_KEY,
             symbol=config.SYMBOL,
             interval_seconds=config.CANDLE_INTERVAL_SECONDS,
             on_candle_close=on_candle_close,
+            min_ticks=config.MIN_TICKS_PER_CANDLE,
         )
     else:
         feed = RESTFeed(
@@ -221,8 +366,12 @@ def run_bot() -> int:
             on_candle_close=on_candle_close,
         )
 
+    global _feed
+    _feed = feed
+
     def _shutdown(signum, frame):  # noqa: ARG001
         log.info("Shutting down (signal %s)…", signum)
+        cmd_listener.stop()
         feed.stop()
         raise SystemExit(0)
 
@@ -272,23 +421,24 @@ def run_test() -> int:
         log.error("Twelve Data request failed: %s", exc)
         return 1
 
-    log.info("Sending test Telegram message (previewing new enhanced format)…")
+    log.info("Sending test Telegram message (previewing slim format)…")
     current_price = float(data.get("close") or 4025.00)
     sample_card = format_signal_message(
         signal="SELL",
         symbol=config.SYMBOL,
         price=current_price,
         timeframe=config.INTERVAL,
+        trigger_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        live_price=current_price + 0.75,
         rsi=88.5,
         adx=36.0,
         ema=current_price + 3.50,
         body_ratio=1.0,
-        setup_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
     ok = send_telegram(
         config.TELEGRAM_BOT_TOKEN,
         config.TELEGRAM_CHAT_ID,
-        "🧪 <b>TEST ALERT (PREVIEW OF NEW CARD FORMAT)</b>\n\n" + sample_card,
+        "🧪 <b>TEST ALERT (slim format preview)</b>\n\n" + sample_card,
     )
     if not ok:
         return 1
@@ -304,6 +454,7 @@ def run_test() -> int:
                 "outputsize": max(config.MIN_BARS + 10, 120),
                 "apikey": config.TWELVE_DATA_API_KEY,
                 "order": "ASC",
+                "timezone": "UTC",
             },
             timeout=30,
         )
@@ -371,6 +522,7 @@ def run_backtest(bars: int = 5000) -> int:
                 "outputsize": bars,
                 "apikey": config.TWELVE_DATA_API_KEY,
                 "order": "ASC",
+                "timezone": "UTC",
             },
             timeout=60,
         )

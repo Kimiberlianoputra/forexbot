@@ -287,3 +287,55 @@ numpy>=1.24.0
 websocket-client>=1.7.0
 python-dotenv>=1.0.0
 
+
+---
+
+## Changelog — 2026-10-29 (data-integrity & honesty rework)
+
+### The bugs found
+
+1. **Phantom signals from sparse WebSocket ticks.** The free WS tier delivers
+   ticks in bursts; `CandleBuilder` stitched stale ticks into candles that
+   never existed. Verified example: on 2026-10-29 12:11 UTC the bot fired a
+   SELL @ 4024.95 off a "red candle" — but the real bar was GREEN closing at
+   4026.79 (rallying to 4029 a minute later). The signal never happened.
+2. **Outcome tracker resolved trades against the wrong bars.** `_fetch_bars`
+   passed `start_date` + `outputsize` but no `end_date`, so Twelve Data
+   returned the *most recent* bars instead of the bars following the signal.
+   Signals from Oct 20/21 were "resolved" against a bar from Oct 22 00:49
+   (identical exit price 4115.25756 on all of them). All win-rate stats and
+   the old confidence meter were calibrated on this garbage.
+3. **Duplicate outcome rows** — systemd tracker + manual runs had no lock.
+4. **Raw Unix time in alerts** (`Time: 1793275800`) and it showed the *setup*
+   bar, not the trigger bar.
+5. **Confidence meter was circular** (+35 for every SELL by definition) and
+   maxed out at 99% for every strong setup.
+
+### The fixes
+
+- `CandleBuilder`: candles now carry `ticks` + `complete`; incomplete candles
+  (minute-gap inside, or < `MIN_TICKS_PER_CANDLE` ticks) are dropped before
+  they can poison indicators.
+- **REST confirmation guard** (`CONFIRM_WITH_REST=true`): before alerting, the
+  strategy is re-run on REST candles (source of truth). A signal REST does not
+  reproduce is rejected and logged. Costs ~1 credit per actual signal.
+- `outcome_tracker._fetch_bars`: explicit `end_date` (signal + 80 min, clamped
+  to now) + misalignment sanity check + `flock` single-instance guard.
+- Alerts: real trigger-bar time in UTC, "Entry (bar close)" label, live price
+  with delta, one-line indicator strip, fake confidence meter removed
+  (~20 lines → ~12).
+- TP/SL single source of truth in `config.py`; optional `TP_SL_MODE=atr`
+  (TP = 1.5×ATR(14), SL = 1.0×ATR(14), floor `MIN_SL_DOLLARS`).
+- `SIGNAL_COOLDOWN_SECONDS=300` against back-to-back spam; `ENABLE_BUY` /
+  `ENABLE_SELL` switches.
+- `prime_history` skips the currently-forming candle and parses timestamps as
+  UTC explicitly.
+- `signals.csv` schema: new `atr`, `tp_dollars`, `sl_dollars` columns
+  (auto-migrates); tracker reads per-signal TP/SL with config fallback.
+
+### Honest performance so far (corrupted rows removed, 2026-10-29)
+
+42 clean resolved signals: **8W / 16L / 18 timeouts — 33.3% win rate,
+−$15.11 total (−$0.36/trade)** at 1:1.5 RR (break-even needs >40%).
+SELL: 6W/5L (55%, +$27.80) · BUY: 2W/11L (15%, −$42.90).
+Small sample — treat as a red flag, not a verdict.
